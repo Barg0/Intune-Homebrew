@@ -390,7 +390,7 @@ SCRIPT_START_TIME=\$(date +%s%N)
 
 # ---------------------------[ Script Name ]---------------------------
 SCRIPT_NAME="Install_${APP_NAME// /_}"
-LOG_FILE_NAME="install_${CASK_NAME}.log"
+LOG_FILE_NAME="$(date '+%Y-%m-%d')-install.log"
 
 # ---------------------------[ Logging Setup ]---------------------------
 LOG=true
@@ -543,35 +543,105 @@ write_log "${APP_NAME} not found. Proceeding with installation." "Info"
 # ---------------------------[ Install via brew ]---------------------------
 write_log "Running: brew install \$INSTALL_CMD" "Run"
 
-INSTALL_OUTPUT=\$(su -l "\$CURRENT_USER" -c "
-    export HOME=\"\$USER_HOME\"
-    export PATH=\"\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"
-    export HOMEBREW_NO_AUTO_UPDATE=1
-    \"\$BREW_PATH\" install \$INSTALL_CMD
-" 2>&1)
-INSTALL_EXIT=\$?
+if [ "\$BREW_TYPE" = "cask" ]; then
+    # LAPS / standard user fix:
+    # brew internally calls sudo to copy the .app to /Applications — this
+    # fails for standard users (no admin rights). Instead we:
+    #   1. Tell brew to stage into a temp dir the user can write to (no sudo needed)
+    #   2. Copy the .app to /Applications ourselves as root (we already are root)
+    #   3. Fix ownership + remove quarantine
 
-while IFS= read -r LINE; do
-    [ -n "\$LINE" ] && write_log "brew | \$LINE" "Debug"
-done <<< "\$INSTALL_OUTPUT"
+    TEMP_APPDIR="\$(mktemp -d /tmp/brew_appdir_XXXXXX)"
+    chown "\$CURRENT_USER" "\$TEMP_APPDIR"
+    write_log "Staging app to temp dir: \$TEMP_APPDIR" "Debug"
 
-if [ \$INSTALL_EXIT -ne 0 ]; then
-    write_log "brew install \$INSTALL_CMD failed (exit \$INSTALL_EXIT)." "Error"
-    complete_script 1
+    INSTALL_OUTPUT=\$(su -l "\$CURRENT_USER" -c "
+        export HOME=\"\$USER_HOME\"
+        export PATH=\"\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"
+        export HOMEBREW_NO_AUTO_UPDATE=1
+        \"\$BREW_PATH\" install --cask --appdir=\"\$TEMP_APPDIR\" ${CASK_NAME}
+    " 2>&1)
+    INSTALL_EXIT=\$?
+
+    while IFS= read -r LINE; do
+        [ -n "\$LINE" ] && write_log "brew | \$LINE" "Debug"
+    done <<< "\$INSTALL_OUTPUT"
+
+    if [ \$INSTALL_EXIT -ne 0 ]; then
+        write_log "brew install --cask ${CASK_NAME} failed (exit \$INSTALL_EXIT)." "Error"
+        rm -rf "\$TEMP_APPDIR"
+        complete_script 1
+    fi
+
+    write_log "brew staging completed. Copying to /Applications as root..." "Run"
+
+    # Find the staged .app (may differ from expected name)
+    STAGED_APP=\$(find "\$TEMP_APPDIR" -maxdepth 1 -name "*.app" -type d | head -1)
+
+    if [ -z "\$STAGED_APP" ]; then
+        write_log "No .app found in \$TEMP_APPDIR after brew install." "Error"
+        rm -rf "\$TEMP_APPDIR"
+        complete_script 1
+    fi
+
+    STAGED_BUNDLE=\$(basename "\$STAGED_APP")
+    APP_DEST="/Applications/\$STAGED_BUNDLE"
+    write_log "Staged: \$STAGED_BUNDLE → copying to /Applications/" "Debug"
+
+    # Remove existing version if present
+    [ -d "\$APP_DEST" ] && rm -rf "\$APP_DEST"
+
+    # Copy as root — no sudo prompt needed
+    cp -R "\$STAGED_APP" "/Applications/"
+    CP_EXIT=\$?
+    rm -rf "\$TEMP_APPDIR"
+
+    if [ \$CP_EXIT -ne 0 ]; then
+        write_log "Failed to copy \$STAGED_BUNDLE to /Applications (exit \$CP_EXIT)." "Error"
+        complete_script 1
+    fi
+
+    # Fix ownership and remove quarantine
+    chown -R "\$CURRENT_USER":staff "\$APP_DEST" 2>/dev/null || true
+    xattr -r -d com.apple.quarantine "\$APP_DEST" 2>/dev/null || true
+    write_log "Ownership set to \$CURRENT_USER, quarantine cleared." "Debug"
+
+else
+    # Formula — no /Applications copy needed, brew installs binary directly
+    INSTALL_OUTPUT=\$(su -l "\$CURRENT_USER" -c "
+        export HOME=\"\$USER_HOME\"
+        export PATH=\"\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"
+        export HOMEBREW_NO_AUTO_UPDATE=1
+        \"\$BREW_PATH\" install ${CASK_NAME}
+    " 2>&1)
+    INSTALL_EXIT=\$?
+
+    while IFS= read -r LINE; do
+        [ -n "\$LINE" ] && write_log "brew | \$LINE" "Debug"
+    done <<< "\$INSTALL_OUTPUT"
+
+    if [ \$INSTALL_EXIT -ne 0 ]; then
+        write_log "brew install ${CASK_NAME} failed (exit \$INSTALL_EXIT)." "Error"
+        complete_script 1
+    fi
 fi
 
-write_log "brew install completed." "Run"
+write_log "Installation completed." "Run"
 
 # ---------------------------[ Verify ]---------------------------
 write_log "Verifying installation..." "Get"
 if [ "\$BREW_TYPE" = "cask" ]; then
     APP_DEST="/Applications/${APP_BUNDLE}"
+    # Also check staged bundle name in case it differs
+    if [ ! -d "\$APP_DEST" ]; then
+        APP_DEST=\$(find /Applications -maxdepth 1 -name "*.app" -newer /tmp -type d 2>/dev/null | head -1)
+    fi
     if [ -d "\$APP_DEST" ]; then
         INSTALLED_VER=\$(defaults read "\$APP_DEST/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo "unknown")
         write_log "${APP_NAME} \$INSTALLED_VER verified at \$APP_DEST" "Success"
         complete_script 0
     else
-        write_log "${APP_NAME} not found at \$APP_DEST after install." "Error"
+        write_log "${APP_NAME} not found in /Applications after install." "Error"
         complete_script 1
     fi
 else
