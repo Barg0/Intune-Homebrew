@@ -516,10 +516,10 @@ if [ "\$BREW_TYPE" = "cask" ]; then
         write_log "${APP_NAME} already installed (\$INSTALLED_VER) — nothing to do." "Success"
         complete_script 0
     fi
-    if su -l "\$CURRENT_USER" -c "
-        export PATH=\"\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin\"
-        \"\$BREW_PATH\" list --cask '${CASK_NAME}'
-    " &>/dev/null; then
+    USER_UID=\$(id -u "\$CURRENT_USER")
+    if launchctl asuser "\$USER_UID" sudo -u "\$CURRENT_USER" \
+        /usr/bin/env PATH="\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin" \
+        "\$BREW_PATH" list --cask '${CASK_NAME}' &>/dev/null; then
         write_log "${APP_NAME} already managed by Homebrew — nothing to do." "Success"
         complete_script 0
     fi
@@ -529,10 +529,9 @@ else
         write_log "${APP_NAME} binary already exists at \$FORMULA_BIN — nothing to do." "Success"
         complete_script 0
     fi
-    if su -l "\$CURRENT_USER" -c "
-        export PATH=\"\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin\"
-        \"\$BREW_PATH\" list --formula '${CASK_NAME}'
-    " &>/dev/null; then
+    if launchctl asuser "\$USER_UID" sudo -u "\$CURRENT_USER" \
+        /usr/bin/env PATH="\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin" \
+        "\$BREW_PATH" list --formula '${CASK_NAME}' &>/dev/null; then
         write_log "${APP_NAME} already managed by Homebrew — nothing to do." "Success"
         complete_script 0
     fi
@@ -544,120 +543,52 @@ write_log "${APP_NAME} not found. Proceeding with installation." "Info"
 write_log "Running: brew install \$INSTALL_CMD" "Run"
 
 if [ "\$BREW_TYPE" = "cask" ]; then
-    # LAPS / standard user fix:
-    # brew internally calls sudo when installing casks — this fails for
-    # standard users (no admin rights, LAPS managed). Our postinstall
-    # already runs as root so we handle two cask types:
+    # THE CORRECT PATTERN (scriptingosx.com — the definitive Mac admin reference):
     #
-    #   Type A — DMG/ZIP cask (.app bundle):
-    #     brew stages to a temp appdir the user can write to (no sudo),
-    #     then we copy the .app to /Applications as root.
+    # We run as root via Intune PKG postinstall. We cannot call brew as root
+    # (brew explicitly aborts). We must run brew as the user. But brew's internal
+    # sudo calls (sudo cp, sudo installer) fail for standard LAPS users.
     #
-    #   Type B — PKG cask (e.g. TeamViewer, Zoom):
-    #     brew downloads to Caskroom, then we run installer directly
-    #     as root — bypassing brew's sudo call entirely.
+    # The solution: launchctl asuser $uid sudo -u $user brew install
+    #
+    # - launchctl asuser: places the process in the user's login session
+    # - sudo -u $user: runs as the user (no password needed — we're already root)
+    # - brew's internal sudo calls: satisfied because the parent is root context
+    #
+    # This is the standard Mac admin pattern for running user commands from root.
+    # No sudoers file, no dscl group changes, no hacks.
 
-    # --- Step 1: let brew download + stage to Caskroom (no install attempt) ---
-    write_log "Downloading cask to Caskroom via brew fetch..." "Run"
+    USER_UID=\$(id -u "\$CURRENT_USER")
+    write_log "User UID: \$USER_UID" "Debug"
 
-    FETCH_OUTPUT=\$(su -l "\$CURRENT_USER" -c "
-        export HOME=\"\$USER_HOME\"
-        export PATH=\"\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"
-        export HOMEBREW_NO_AUTO_UPDATE=1
-        \"\$BREW_PATH\" fetch --cask ${CASK_NAME}
-    " 2>&1)
-    FETCH_EXIT=\$?
+    INSTALL_OUTPUT=\$(launchctl asuser "\$USER_UID" sudo -u "\$CURRENT_USER" \
+        /usr/bin/env \
+        HOME="\$USER_HOME" \
+        PATH="\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        HOMEBREW_NO_AUTO_UPDATE=1 \
+        "\$BREW_PATH" install --cask ${CASK_NAME} 2>&1)
+    INSTALL_EXIT=\$?
 
     while IFS= read -r LINE; do
-        [ -n "\$LINE" ] && write_log "brew fetch | \$LINE" "Debug"
-    done <<< "\$FETCH_OUTPUT"
+        [ -n "\$LINE" ] && write_log "brew | \$LINE" "Debug"
+    done <<< "\$INSTALL_OUTPUT"
 
-    if [ \$FETCH_EXIT -ne 0 ]; then
-        write_log "brew fetch --cask ${CASK_NAME} failed (exit \$FETCH_EXIT)." "Error"
+    if [ \$INSTALL_EXIT -ne 0 ]; then
+        write_log "brew install --cask ${CASK_NAME} failed (exit \$INSTALL_EXIT)." "Error"
         complete_script 1
     fi
 
-    write_log "Cask fetched successfully. Detecting install type..." "Get"
-
-    # --- Step 2: detect what was downloaded (PKG or DMG/APP) ---
-    CASKROOM_DIR="\$(find /opt/homebrew/Caskroom/${CASK_NAME} -maxdepth 2 \( -name "*.pkg" -o -name "*.app" \) 2>/dev/null | head -1)"
-    CASKROOM_VERSIONED="\$(find /opt/homebrew/Caskroom/${CASK_NAME} -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1)"
-
-    # Check for PKG first
-    STAGED_PKG=\$(find "\$CASKROOM_VERSIONED" -maxdepth 2 -name "*.pkg" -type f 2>/dev/null | head -1)
-    # Check for APP
-    STAGED_APP=\$(find "\$CASKROOM_VERSIONED" -maxdepth 2 -name "*.app" -type d 2>/dev/null | head -1)
-
-    if [ -n "\$STAGED_PKG" ]; then
-        # --- Type B: PKG cask (TeamViewer, Zoom etc.) ---
-        write_log "PKG cask detected: \$(basename \$STAGED_PKG)" "Get"
-        write_log "Running installer as root (bypassing brew sudo)..." "Run"
-
-        installer -pkg "\$STAGED_PKG" -target / 2>&1 | while IFS= read -r LINE; do
-            [ -n "\$LINE" ] && write_log "installer | \$LINE" "Debug"
-        done
-        INSTALL_EXIT=\${PIPESTATUS[0]}
-
-        if [ \$INSTALL_EXIT -ne 0 ]; then
-            write_log "installer failed for \$(basename \$STAGED_PKG) (exit \$INSTALL_EXIT)." "Error"
-            complete_script 1
-        fi
-        write_log "PKG installation completed." "Run"
-
-    elif [ -n "\$STAGED_APP" ]; then
-        # --- Type A: DMG/ZIP cask (.app bundle) ---
-        STAGED_BUNDLE=\$(basename "\$STAGED_APP")
-        APP_DEST="/Applications/\$STAGED_BUNDLE"
-        write_log "APP cask detected: \$STAGED_BUNDLE" "Get"
-        write_log "Copying to /Applications as root..." "Run"
-
-        [ -d "\$APP_DEST" ] && rm -rf "\$APP_DEST"
-        cp -R "\$STAGED_APP" "/Applications/"
-        CP_EXIT=\$?
-
-        if [ \$CP_EXIT -ne 0 ]; then
-            write_log "Failed to copy \$STAGED_BUNDLE to /Applications (exit \$CP_EXIT)." "Error"
-            complete_script 1
-        fi
-
-        chown -R "\$CURRENT_USER":staff "\$APP_DEST" 2>/dev/null || true
-        xattr -r -d com.apple.quarantine "\$APP_DEST" 2>/dev/null || true
-        write_log "Copied, ownership set, quarantine cleared." "Debug"
-
-    else
-        # --- Fallback: let brew handle it fully (last resort) ---
-        write_log "Could not detect PKG or APP in Caskroom — falling back to brew install." "Info"
-
-        TEMP_APPDIR="\$(mktemp -d /tmp/brew_appdir_XXXXXX)"
-        chown "\$CURRENT_USER" "\$TEMP_APPDIR"
-
-        INSTALL_OUTPUT=\$(su -l "\$CURRENT_USER" -c "
-            export HOME=\"\$USER_HOME\"
-            export PATH=\"\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"
-            export HOMEBREW_NO_AUTO_UPDATE=1
-            \"\$BREW_PATH\" install --cask --appdir=\"\$TEMP_APPDIR\" ${CASK_NAME}
-        " 2>&1)
-        INSTALL_EXIT=\$?
-        rm -rf "\$TEMP_APPDIR"
-
-        while IFS= read -r LINE; do
-            [ -n "\$LINE" ] && write_log "brew | \$LINE" "Debug"
-        done <<< "\$INSTALL_OUTPUT"
-
-        if [ \$INSTALL_EXIT -ne 0 ]; then
-            write_log "Fallback brew install failed (exit \$INSTALL_EXIT)." "Error"
-            complete_script 1
-        fi
-    fi
+    write_log "Cask installed and registered in Caskroom — brew upgrade will manage updates." "Run"
 
 else
     # Formula — no /Applications copy needed, brew installs binary directly
-    INSTALL_OUTPUT=\$(su -l "\$CURRENT_USER" -c "
-        export HOME=\"\$USER_HOME\"
-        export PATH=\"\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"
-        export HOMEBREW_NO_AUTO_UPDATE=1
-        \"\$BREW_PATH\" install ${CASK_NAME}
-    " 2>&1)
+    USER_UID=\$(id -u "\$CURRENT_USER")
+    INSTALL_OUTPUT=\$(launchctl asuser "\$USER_UID" sudo -u "\$CURRENT_USER" \
+        /usr/bin/env \
+        HOME="\$USER_HOME" \
+        PATH="\$BREW_PATH_DIR:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        HOMEBREW_NO_AUTO_UPDATE=1 \
+        "\$BREW_PATH" install ${CASK_NAME} 2>&1)
     INSTALL_EXIT=\$?
 
     while IFS= read -r LINE; do
