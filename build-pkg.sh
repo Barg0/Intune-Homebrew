@@ -90,7 +90,7 @@ APP_LIST=(
 
 # ---------------------------[ Build Configuration ]--------------------------
 # Reverse-DNS prefix for the generated pkg identifiers (NOT the app's bundle id).
-ORG_ID="de.saveitfirst.intunebrew"
+ORG_ID="de.barg.intunebrew"
 
 # When the app is already brew-installed on a device and the pkg runs again,
 # should the postinstall also run `brew upgrade --greedy` for that app?
