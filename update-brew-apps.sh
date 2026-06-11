@@ -27,10 +27,12 @@
 #   version, which avoids the failure above.
 #
 # PKG/DMG CASKS
-#   Upgrading a pkg-type cask re-runs `sudo /usr/sbin/installer` internally
-#   (same as install). We stage the identical temporary, SETENV-tagged NOPASSWD
-#   sudoers drop-in around cask upgrades so they succeed non-interactively, then
-#   remove it (mirrors build-pkg.sh).
+#   Upgrading a pkg-type cask first UNINSTALLS the old version (launchctl,
+#   pkgutil --forget, rm of receipt-listed files — all via internal sudo) and
+#   then re-runs `sudo /usr/sbin/installer`. We stage a temporary, SETENV-tagged
+#   NOPASSWD sudoers drop-in covering exactly those binaries around each cask
+#   upgrade so it succeeds non-interactively, then remove it (extends the
+#   installer-only rule used by build-pkg.sh, which only needs fresh installs).
 #
 # DEPLOY IN INTUNE
 #   Devices ▸ macOS ▸ Shell scripts ▸ Add
@@ -43,12 +45,20 @@
 # ---------------------------[ Behaviour Configuration ]----------------------
 # Force-upgrade self-updating casks via brew (see header). Default false.
 # When true, casks already current on disk are skipped (no spurious failures).
-GREEDY_AUTO_UPDATES=false
+GREEDY_AUTO_UPDATES=true
 
 # Exit 1 (Intune marks the run "failed") if any package fails to upgrade.
 # Default false: log the failure clearly but exit 0, so routine scheduled runs
 # don't perpetually alarm on transient issues (e.g. an app being open).
 FAIL_ON_PACKAGE_ERROR=false
+
+# Defer the greedy brew-upgrade of an .app-bundle cask when that app is
+# currently OPEN on the device (replacing an in-use bundle is disruptive and
+# can fail with "It seems the App source ... is not there"; the cask is simply
+# retried on the next scheduled run). pkg-type casks (e.g. TeamViewer) are
+# never deferred — their background daemons would otherwise defer them forever.
+# Set false to always upgrade regardless of whether the app is running.
+SKIP_RUNNING_APPS=false
 # =============================================================================
 
 
@@ -188,15 +198,20 @@ write_log "Architecture: $ARCH | brew: $BREW | owner: $BREW_OWNER" "Get"
 # Works whether the script runs as root (Intune) or already as the owner (manual test).
 brew_as_owner() {
     cd /tmp || return 1
+    # NONINTERACTIVE + SUDO_ASKPASS=/usr/bin/false (same as build-pkg.sh): any
+    # internal sudo NOT covered by the temporary sudoers rule fails fast
+    # instead of stalling on a password prompt in the headless Intune context.
     if [ "$(id -un)" = "$BREW_OWNER" ]; then
         HOME="$USER_HOME" \
         HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ANALYTICS=1 \
+        NONINTERACTIVE=1 \
         PATH="$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
         "$BREW" "$@"
     elif [ "$(id -u)" -eq 0 ]; then
         /usr/bin/sudo -u "$BREW_OWNER" \
             HOME="$USER_HOME" \
             HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ANALYTICS=1 \
+            NONINTERACTIVE=1 SUDO_ASKPASS=/usr/bin/false \
             PATH="$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
             "$BREW" "$@"
     else
@@ -206,15 +221,22 @@ brew_as_owner() {
 }
 
 # ---------------------------[ sudoers helpers (cask upgrades) ]---------------------------
-# Same SETENV-tagged rule used by build-pkg.sh, so brew's internal
-# 'sudo -u root /usr/sbin/installer' for pkg-casks works non-interactively.
+# Same SETENV-tagged pattern as build-pkg.sh, but broader: a cask UPGRADE first
+# UNINSTALLS the old version, and brew internally elevates more than just
+# /usr/sbin/installer for that, e.g.:
+#   sudo launchctl remove <service>                     (launchd services)
+#   sudo -E -- /usr/bin/xargs -0 -- /bin/rm --          (pkgutil file lists)
+#   sudo pkgutil --forget <id>                          (package receipts)
+# Without these, pkg-casks like TeamViewer fail mid-upgrade with
+# "sudo: a terminal is required to read the password".
+# The rule is staged immediately before each upgrade and removed right after.
 SUDOERS_FILE="/etc/sudoers.d/intune-brew-update"
 remove_sudoers() { [ "$(id -u)" -eq 0 ] && rm -f "$SUDOERS_FILE" 2>/dev/null; }
 setup_sudoers() {
     [ "$(id -u)" -eq 0 ] || return 0   # only root can/need write sudoers; manual runs auth interactively
     local tmp
     tmp=$(mktemp) || return 1
-    printf '%s ALL=(root) NOPASSWD: SETENV: /usr/sbin/installer\n' "$BREW_OWNER" > "$tmp"
+    printf '%s ALL=(root) NOPASSWD: SETENV: /usr/sbin/installer, /bin/launchctl, /usr/sbin/pkgutil, /usr/bin/xargs, /bin/rm, /usr/bin/pkill\n' "$BREW_OWNER" > "$tmp"
     if /usr/sbin/visudo -cf "$tmp" >/dev/null 2>&1; then
         /usr/bin/install -m 0440 -o root -g wheel "$tmp" "$SUDOERS_FILE"
         rm -f "$tmp"
@@ -228,11 +250,20 @@ remove_sudoers   # clear any stale rule a prior killed run may have left behind
 
 # ---------------------------[ Resolve a cask's installed .app path ]---------------------------
 # Used by the greedy pass to compare the on-disk version against the tap.
+# Prints "<kind> <path>" where kind is:
+#   app — the cask installs a plain .app bundle (brew moves it itself)
+#   pkg — pkg/dmg-installer cask; the .app path was recovered from
+#         uninstall/zap stanzas (the macOS installer manages it)
+# NOTE: the JSON is passed via an env var (like build-pkg.sh does) — piping it
+# to `python3 - << 'PY'` does NOT work, the heredoc clobbers the piped stdin.
 cask_app_path() {
-    brew_as_owner info --cask "$1" --json=v2 2>/dev/null | python3 - << 'PY' 2>/dev/null
-import sys, json
+    local json
+    json="$(brew_as_owner info --cask "$1" --json=v2 2>/dev/null)"
+    [ -n "$json" ] || return 1
+    CASK_JSON="$json" python3 - << 'PY' 2>/dev/null
+import os, sys, json
 try:
-    c = json.load(sys.stdin)["casks"][0]
+    c = json.loads(os.environ.get("CASK_JSON", ""))["casks"][0]
 except Exception:
     sys.exit(1)
 def base(p): return str(p).rstrip("/").split("/")[-1]
@@ -243,8 +274,8 @@ for a in arts:
         for e in a["app"]:
             if isinstance(e, str): src = e
             elif isinstance(e, dict) and e.get("target"): tgt = e["target"]
-        if tgt: print(tgt); sys.exit(0)
-        if src: print("/Applications/" + base(src)); sys.exit(0)
+        if tgt: print("app " + str(tgt)); sys.exit(0)
+        if src: print("app /Applications/" + base(src)); sys.exit(0)
 for a in arts:
     if not isinstance(a, dict): continue
     for k in ("uninstall","zap"):
@@ -256,8 +287,50 @@ for a in arts:
                 for v in vals:
                     v=str(v)
                     if v.endswith(".app") and "/Applications/" in v:
-                        print(v); sys.exit(0)
+                        print("pkg " + v); sys.exit(0)
 PY
+}
+
+# ---------------------------[ Heal poisoned cask configs ]---------------------------
+# Older install wrappers ran `brew install --cask --appdir=<mktemp dir>` and
+# brew PERSISTS that explicit appdir in Caskroom/<token>/.metadata/config.json
+# forever. Every later upgrade then looks for the app in the long-gone temp
+# dir and fails with:
+#   Error: <token>: It seems the App source '/tmp/brew_appdir_.../<App>.app' is not there.
+# Drop any recorded explicit appdir that points into a temp location or no
+# longer exists, so brew falls back to the default /Applications. A legitimate
+# custom appdir (existing, non-temp) is left untouched.
+heal_cask_configs() {
+    local caskroom="$BREW_PREFIX/Caskroom"
+    [ -d "$caskroom" ] || return 0
+    local cfg token fixed
+    for cfg in "$caskroom"/*/.metadata/config.json; do
+        [ -f "$cfg" ] || continue
+        token="$(basename "$(dirname "$(dirname "$cfg")")")"
+        fixed=$(CFG="$cfg" python3 - << 'PY' 2>/dev/null
+import json, os, sys
+p = os.environ["CFG"]
+try:
+    with open(p) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+explicit = data.get("explicit") or {}
+appdir = explicit.get("appdir")
+if not appdir:
+    sys.exit(0)
+is_tmp = appdir.startswith(("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"))
+if not is_tmp and os.path.isdir(appdir):
+    sys.exit(0)
+del explicit["appdir"]
+with open(p, "w") as f:
+    json.dump(data, f)
+print(appdir)
+PY
+)
+        [ -n "$fixed" ] && write_log "  · $token: dropped stale explicit appdir '$fixed' from cask config." "Info"
+    done
+    return 0
 }
 
 # =============================================================================
@@ -276,6 +349,9 @@ if [ $UPDATE_EXIT -ne 0 ]; then
 else
     write_log "Package index updated." "Success"
 fi
+
+# --- repair cask configs poisoned by old install wrappers (stale --appdir) ---
+heal_cask_configs
 
 # =============================================================================
 # Formulae (CLI tools) — always safe to brew-upgrade
@@ -353,12 +429,22 @@ else
             [ -z "$TOKEN" ] && continue
             TAP_VER="$(brew_as_owner info --cask "$TOKEN" --json=v2 2>/dev/null \
                 | python3 -c "import sys,json; print((json.load(sys.stdin)['casks'][0].get('version') or '').split(',')[0])" 2>/dev/null)"
-            APP_PATH="$(cask_app_path "$TOKEN")"
+            APP_INFO="$(cask_app_path "$TOKEN")"
+            APP_KIND="${APP_INFO%% *}"
+            APP_PATH="${APP_INFO#* }"
             DISK_VER=""
             [ -n "$APP_PATH" ] && [ -d "$APP_PATH" ] && \
                 DISK_VER="$(defaults read "$APP_PATH/Contents/Info" CFBundleShortVersionString 2>/dev/null)"
             if [ -n "$DISK_VER" ] && [ -n "$TAP_VER" ] && ver_ge "$DISK_VER" "$TAP_VER"; then
                 write_log "  · $TOKEN: on-disk $DISK_VER already >= tap $TAP_VER — self-updated, skipping." "Info"
+                continue
+            fi
+            # Optionally defer upgrades of OPEN .app-bundle casks (see
+            # SKIP_RUNNING_APPS in the configuration block at the top).
+            # Match on the bundle path only — Electron apps rewrite their
+            # helper process command lines, so deeper paths don't reliably match.
+            if [ "$SKIP_RUNNING_APPS" = "true" ] && [ "$APP_KIND" = "app" ] && [ -n "$APP_PATH" ] && /usr/bin/pgrep -qf "$APP_PATH" 2>/dev/null; then
+                write_log "  · $TOKEN: app is currently running (disk='${DISK_VER:-?}' tap='${TAP_VER:-?}') — deferring to next run." "Info"
                 continue
             fi
             write_log "  → upgrading $TOKEN (disk='${DISK_VER:-?}' tap='${TAP_VER:-?}')..." "Run"
